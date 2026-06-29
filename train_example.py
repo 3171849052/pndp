@@ -1,34 +1,38 @@
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 import networkx as nx
 import copy
 import numpy as np
-import os
 import sys
 import json
 from datetime import datetime
 from tqdm import tqdm
 from opacus import PrivacyEngine
 from opacus.validators import ModuleValidator
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from datasets import load_dataset
+from peft import get_peft_model, LoraConfig, TaskType
 
 from pndp_calculator import PNDPAccountant
 
-DATASET = "CIFAR100"
+DATASET = "SST2"
 GRAPH = "florentine_families"
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 T_LOCAL_STEPS = 50
-R_ROUNDS = 10
+R_ROUNDS = 5
 K_GOSSIP = 1
 EPSILON = 3.0
 DELTA = 1e-5
 CLIP_NORM = 1.0
-LR = 0.01
+LR = 2e-4
 GPU = 3
-FRAMEWORK = "GDP"
+FRAMEWORK = "GDP"   # "GDP" or "RDP"
+ALGORITHM = "Average"   # "Average" "LDP-per-round" "All Numeric"
+ENABLE_PRIVACY = False   # 控制是否开启差分隐私训练
 
 # python train_example.py
 
@@ -41,48 +45,30 @@ def get_graph(name):
     return graph_fns[name]()
 
 
-def get_dataset_config(name):
-    configs = {
-        "CIFAR100": {
-            "num_classes": 100,
-            "mean": (0.5071, 0.4867, 0.4408),
-            "std": (0.2675, 0.2565, 0.2761),
-        },
-        "CIFAR10": {
-            "num_classes": 10,
-            "mean": (0.4914, 0.4822, 0.4465),
-            "std": (0.2023, 0.1994, 0.2010),
-        },
-    }
-    if name not in configs:
-        raise ValueError(f"Unknown dataset: {name}")
-    return configs[name]
-
-
-def load_dataset(name, root, train, transform):
-    dataset_fns = {
-        "CIFAR100": torchvision.datasets.CIFAR100,
-        "CIFAR10": torchvision.datasets.CIFAR10,
-    }
-    if name not in dataset_fns:
-        raise ValueError(f"Unknown dataset: {name}")
-    return dataset_fns[name](root=root, train=train, download=True, transform=transform)
-
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def get_resnet_model(num_classes=100):
-    model = torchvision.models.resnet18(num_classes=num_classes)
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    model.maxpool = nn.Identity()
+def get_roberta_lora_model(num_classes=2):
+    model = AutoModelForSequenceClassification.from_pretrained(
+        "roberta-base", num_labels=num_classes
+    )
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        inference_mode=False,
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        target_modules=["query", "value"],
+        modules_to_save=["classifier"],
+    )
+    model = get_peft_model(model, peft_config)
+    for module in model.modules():
+        if hasattr(module, "inplace"):
+            module.inplace = False
     return model
 
 
 class DecentralizedNode:
-    def __init__(self, node_id, data_indices, dataset, noise_multiplier, num_classes=100):
+    def __init__(self, node_id, data_indices, dataset, noise_multiplier, num_classes=2, enable_privacy=True):
         self.node_id = node_id
-        self.model = ModuleValidator.fix(get_resnet_model(num_classes)).to(DEVICE)
+        self.model = ModuleValidator.fix(get_roberta_lora_model(num_classes)).to(DEVICE)
         self.optimizer = optim.SGD(self.model.parameters(), lr=LR, momentum=0.9)
         self.criterion = nn.CrossEntropyLoss()
 
@@ -91,33 +77,36 @@ class DecentralizedNode:
 
         self.noise_multiplier = noise_multiplier
 
-        self.privacy_engine = PrivacyEngine()
-        self.model, self.optimizer, self.dataloader = self.privacy_engine.make_private(
-            module=self.model,
-            optimizer=self.optimizer,
-            data_loader=self.dataloader,
-            noise_multiplier=self.noise_multiplier,
-            max_grad_norm=CLIP_NORM,
-        )
+        if enable_privacy:
+            self.privacy_engine = PrivacyEngine()
+            self.model, self.optimizer, self.dataloader = self.privacy_engine.make_private(
+                module=self.model,
+                optimizer=self.optimizer,
+                data_loader=self.dataloader,
+                noise_multiplier=self.noise_multiplier,
+                max_grad_norm=CLIP_NORM,
+            )
         self.data_iterator = iter(self.dataloader)
 
     def get_next_batch(self):
         try:
-            inputs, targets = next(self.data_iterator)
+            batch = next(self.data_iterator)
         except StopIteration:
             self.data_iterator = iter(self.dataloader)
-            inputs, targets = next(self.data_iterator)
-        return inputs.to(DEVICE), targets.to(DEVICE)
+            batch = next(self.data_iterator)
+        return {k: v.to(DEVICE) for k, v in batch.items()}
 
-    def local_update(self, local_steps):
+    def local_update(self, local_steps, desc=None):
         self.model.train()
-        for step in range(local_steps):
-            inputs, targets = self.get_next_batch()
+        step_pbar = tqdm(range(local_steps), desc=desc, leave=False)
+        for step in step_pbar:
+            batch = self.get_next_batch()
             self.optimizer.zero_grad()
-            outputs = self.model(inputs)
-            loss = self.criterion(outputs, targets)
+            outputs = self.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+            loss = self.criterion(outputs.logits, batch["labels"])
             loss.backward()
             self.optimizer.step()
+            step_pbar.set_postfix(loss=f"{loss.item():.4f}")
         return loss.item()
 
 
@@ -126,43 +115,67 @@ def evaluate_model(model, test_loader, device):
     correct = 0
     total = 0
     with torch.no_grad():
-        for inputs, targets in test_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
-            total += targets.size(0)
-            correct += (predicted == targets).sum().item()
+        for batch in test_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            _, predicted = torch.max(outputs.logits, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
     return 100.0 * correct / total
 
 
 def daemonize(log_path):
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    
+    # 第一次 fork
     pid = os.fork()
     if pid > 0:
-        return pid
-    os.setsid()
-    pid = os.fork()
-    if pid > 0:
+        # 父进程直接退出
         sys.exit(0)
+        
+    os.setsid() # 脱离控制终端
+    
+    # 第二次 fork
+    pid = os.fork()
+    if pid > 0:
+        # 第一个子进程：打印真正的守护进程 PID（即第二个子进程）并退出
+        print(f"kill {pid}")
+        sys.exit(0)
+        
+    # 第二个子进程（真正的守护进程）继续往下执行
+    # 刷新缓冲区，防止重定向前的残留内容被重复打印
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
+    # 将标准输出和标准错误重定向到日志文件（推荐追加模式 "a" 结合 flush 或 "w"）
     log_file = open(log_path, "w")
-    sys.stdout = log_file
-    sys.stderr = log_file
+    os.dup2(log_file.fileno(), sys.stdout.fileno())
+    os.dup2(log_file.fileno(), sys.stderr.fileno())
+    
+    # 守护进程返回，准备执行接下来的模型训练代码
 
 
 def main():
     foreground = "--foreground" in sys.argv
 
-    if GPU is not None:
-        torch.cuda.set_device(GPU)
+    if os.name == 'nt':
+        print("[Warning] Windows system detected, forcing foreground mode.")
+        foreground = True 
 
     G = get_graph(GRAPH)
     nodes_list = list(G.nodes())
     num_nodes = len(nodes_list)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if ENABLE_PRIVACY:
+        dp_str = f"DP_True_e{EPSILON}_d{DELTA}_CN{CLIP_NORM}"
+    else:
+        dp_str = "DP_False"
     out_dir = os.path.join(
         "exps",
-        f"{timestamp}_{DATASET}_{GRAPH}_e{EPSILON}_d{DELTA}_R{R_ROUNDS}_N{num_nodes}_K{K_GOSSIP}_T{T_LOCAL_STEPS}_B{BATCH_SIZE}_LR{LR}_CN{CLIP_NORM}_F{FRAMEWORK}"
+        f"{timestamp}_{DATASET}_{GRAPH}_{dp_str}_R{R_ROUNDS}_N{num_nodes}_K{K_GOSSIP}_T{T_LOCAL_STEPS}_B{BATCH_SIZE}_LR{LR}_F{FRAMEWORK}"
     )
     os.makedirs(out_dir, exist_ok=True)
 
@@ -170,43 +183,48 @@ def main():
 
     if not foreground:
         print(f"tail -f {log_path}")
-        pid = daemonize(log_path)
-        print(f"kill {pid}")
-        sys.exit(0)
+        # 守护进程的启动、父进程的退出和 kill PID 的打印都在这一个函数中完成了
+        daemonize(log_path) 
+        # ⚠️ 不要在这里写 sys.exit(0) 了，否则守护进程还是会自杀
     else:
         print(f"[Foreground] Log: {log_path}")
 
+    global DEVICE
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if GPU is not None and torch.cuda.is_available():
+        torch.cuda.set_device(GPU)
+
     print(f"Using device: {DEVICE}")
 
-    cfg = get_dataset_config(DATASET)
+    tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+    hf_dataset = load_dataset("stanfordnlp/sst2")
 
-    transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(cfg["mean"], cfg["std"]),
-    ])
-    train_dataset = load_dataset(DATASET, root='./data', train=True, transform=transform)
+    def tokenize_fn(examples):
+        return tokenizer(examples["sentence"], padding="max_length", truncation=True, max_length=128)
 
-    test_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(cfg["mean"], cfg["std"]),
-    ])
-    test_dataset = load_dataset(DATASET, root='./data', train=False, transform=test_transform)
+    tokenized_datasets = hf_dataset.map(tokenize_fn, batched=True)
+    tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
+    tokenized_datasets.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+
+    train_dataset = tokenized_datasets["train"]
+    test_dataset = tokenized_datasets["validation"]
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     samples_per_node = len(train_dataset) // num_nodes
-    acc = PNDPAccountant(
-        N_samples=samples_per_node,
-        batch_size=BATCH_SIZE,
-        T_local_steps=T_LOCAL_STEPS,
-        R_rounds=R_ROUNDS,
-        K_gossip=K_GOSSIP,
-    )
-    acc.set_graph(G)
+    if ENABLE_PRIVACY:
+        acc = PNDPAccountant(
+            N_samples=samples_per_node,
+            batch_size=BATCH_SIZE,
+            T_local_steps=T_LOCAL_STEPS,
+            R_rounds=R_ROUNDS,
+            K_gossip=K_GOSSIP,
+        )
+        acc.set_graph(G)
 
-    nm, m = acc.get_noise_multiplier(EPSILON, DELTA, algorithm="Average", framework=FRAMEWORK)
-    print(f"[Privacy] Calculated Noise Multiplier: {nm:.4f}")
+        nm, m = acc.get_noise_multiplier(EPSILON, DELTA, algorithm=ALGORITHM, framework=FRAMEWORK)
+        print(f"[Privacy] Calculated Noise Multiplier: {nm:.4f}")
+    else:
+        nm = 0.0
 
     params = {
         "timestamp": timestamp,
@@ -214,7 +232,7 @@ def main():
         "DATASET": DATASET,
         "GRAPH": GRAPH,
         "num_nodes": num_nodes,
-        "num_classes": cfg["num_classes"],
+        "num_classes": 2,
         "N_SAMPLES_TOTAL": len(train_dataset),
         "BATCH_SIZE": BATCH_SIZE,
         "T_LOCAL_STEPS": T_LOCAL_STEPS,
@@ -227,6 +245,7 @@ def main():
         "LR": LR,
         "noise_multiplier": float(nm),
         "samples_per_node": samples_per_node,
+        "ENABLE_PRIVACY": ENABLE_PRIVACY,
     }
     with open(os.path.join(out_dir, "params.json"), "w") as f:
         json.dump(params, f, indent=2)
@@ -245,7 +264,8 @@ def main():
             data_indices=indices,
             dataset=train_dataset,
             noise_multiplier=nm,
-            num_classes=cfg["num_classes"],
+            num_classes=2,
+            enable_privacy=ENABLE_PRIVACY,
         )
 
     print("Starting Decentralized Training...")
@@ -254,8 +274,10 @@ def main():
         print(f"\n--- Round {round_idx + 1}/{R_ROUNDS} ---")
 
         round_losses = []
-        for node_name, node_obj in tqdm(node_objects.items(), desc=f"Round {round_idx+1} Train", leave=False):
-            loss = node_obj.local_update(T_LOCAL_STEPS)
+        pbar = tqdm(enumerate(node_objects.items()), desc=f"Round {round_idx+1} Train", leave=False)
+        for i, (node_name, node_obj) in pbar:
+            pbar.set_postfix(node=i)
+            loss = node_obj.local_update(T_LOCAL_STEPS, desc=f"  Node {i}")
             round_losses.append(loss)
         print(f"Average Local Loss: {np.mean(round_losses):.4f}")
 
@@ -281,7 +303,9 @@ def main():
             node_objects[node_name].model.load_state_dict(new_state_dict)
 
         accuracies = []
-        for node_name, node_obj in tqdm(node_objects.items(), desc=f"Round {round_idx+1} Eval", leave=False):
+        pbar = tqdm(enumerate(node_objects.items()), desc=f"Round {round_idx+1} Eval", leave=False)
+        for i, (node_name, node_obj) in pbar:
+            pbar.set_postfix(node=i)
             acc = evaluate_model(node_obj.model, test_loader, DEVICE)
             accuracies.append(acc)
         mean_acc = np.mean(accuracies)
