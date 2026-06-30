@@ -1,8 +1,10 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 import networkx as nx
 import copy
@@ -12,6 +14,7 @@ import json
 from datetime import datetime
 from tqdm import tqdm
 from opacus import PrivacyEngine
+from opacus.utils.batch_memory_manager import BatchMemoryManager
 from opacus.validators import ModuleValidator
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from datasets import load_dataset
@@ -22,19 +25,28 @@ from pndp_calculator import PNDPAccountant
 DATASET = "SST2"
 GRAPH = "florentine_families"
 BATCH_SIZE = 16
+MAX_PHYSICAL_BATCH_SIZE = 16
 T_LOCAL_STEPS = 10
 R_ROUNDS = 50
 K_GOSSIP = 1
-EPSILON = 3.0
+EPSILON = 8.0
 DELTA = 1e-5
-CLIP_NORM = 1.0
-LR = 3e-4
-GPU = 3
+CLIP_NORM = 1
+LR = 1e-3 
+GPU = 1
 FRAMEWORK = "GDP"   # "GDP" or "RDP"
 ALGORITHM = "Average"   # "Average" "LDP-per-round" "All Numeric"
 ENABLE_PRIVACY = False   # 控制是否开启差分隐私训练
+SET_NM = None
 
 # python train_example.py
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def get_graph(name):
     graph_fns = {
@@ -66,10 +78,14 @@ def get_roberta_lora_model(num_classes=2):
 
 
 class DecentralizedNode:
-    def __init__(self, node_id, data_indices, dataset, noise_multiplier, num_classes=2, enable_privacy=True):
+    def __init__(self, node_id, data_indices, dataset, noise_multiplier, num_classes=2, enable_privacy=True, init_state_dict=None):
         self.node_id = node_id
-        self.model = ModuleValidator.fix(get_roberta_lora_model(num_classes)).to(DEVICE)
-        self.optimizer = optim.SGD(self.model.parameters(), lr=LR, momentum=0.9)
+        self.enable_privacy = enable_privacy
+        self.model = ModuleValidator.fix(get_roberta_lora_model(num_classes))
+        if init_state_dict is not None:
+            self.model.load_state_dict(init_state_dict, strict=False)
+        self.model = self.model.to(DEVICE)
+        self.optimizer = AdamW(self.model.parameters(), lr=LR, weight_decay=0.01)
         self.criterion = nn.CrossEntropyLoss()
 
         local_subset = Subset(dataset, data_indices)
@@ -86,27 +102,62 @@ class DecentralizedNode:
                 noise_multiplier=self.noise_multiplier,
                 max_grad_norm=CLIP_NORM,
             )
-        self.data_iterator = iter(self.dataloader)
-
-    def get_next_batch(self):
-        try:
-            batch = next(self.data_iterator)
-        except StopIteration:
-            self.data_iterator = iter(self.dataloader)
-            batch = next(self.data_iterator)
-        return {k: v.to(DEVICE) for k, v in batch.items()}
 
     def local_update(self, local_steps, desc=None):
         self.model.train()
-        step_pbar = tqdm(range(local_steps), desc=desc, leave=False)
-        for step in step_pbar:
-            batch = self.get_next_batch()
+        accumulation_steps = BATCH_SIZE // MAX_PHYSICAL_BATCH_SIZE
+        physical_steps_needed = local_steps * accumulation_steps
+        physical_steps_done = 0
+        step_pbar = tqdm(total=physical_steps_needed, desc=desc, leave=False)
+
+        if self.enable_privacy:
+            while physical_steps_done < physical_steps_needed:
+                with BatchMemoryManager(
+                    data_loader=self.dataloader,
+                    max_physical_batch_size=MAX_PHYSICAL_BATCH_SIZE,
+                    optimizer=self.optimizer
+                ) as memory_safe_data_loader:
+                    for batch in memory_safe_data_loader:
+                        batch = {k: v.to(DEVICE) for k, v in batch.items()}
+                        self.optimizer.zero_grad()
+                        outputs = self.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                        loss = self.criterion(outputs.logits, batch["labels"])
+                        loss.backward()
+                        self.optimizer.step()
+
+                        physical_steps_done += 1
+                        step_pbar.update(1)
+                        step_pbar.set_postfix(loss=f"{loss.item():.4f}")
+                        if physical_steps_done >= physical_steps_needed:
+                            break
+        else:
+            data_iterator = iter(self.dataloader)
             self.optimizer.zero_grad()
-            outputs = self.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-            loss = self.criterion(outputs.logits, batch["labels"])
-            loss.backward()
-            self.optimizer.step()
-            step_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            while physical_steps_done < physical_steps_needed:
+                try:
+                    batch = next(data_iterator)
+                except StopIteration:
+                    data_iterator = iter(self.dataloader)
+                    batch = next(data_iterator)
+
+                batch = {k: v.to(DEVICE) for k, v in batch.items()}
+                outputs = self.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+
+                loss = self.criterion(outputs.logits, batch["labels"])
+                scaled_loss = loss / accumulation_steps
+                scaled_loss.backward()
+
+                physical_steps_done += 1
+
+                if physical_steps_done % accumulation_steps == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                step_pbar.update(1)
+                step_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        step_pbar.close()
         return loss.item()
 
 
@@ -189,12 +240,11 @@ def main():
 
     if not foreground:
         print(f"tail -f {log_path}")
-        # 守护进程的启动、父进程的退出和 kill PID 的打印都在这一个函数中完成了
         daemonize(log_path) 
-        # ⚠️ 不要在这里写 sys.exit(0) 了，否则守护进程还是会自杀
     else:
         print(f"[Foreground] Log: {log_path}")
 
+    set_seed(42)
     global DEVICE
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -224,9 +274,12 @@ def main():
             K_gossip=K_GOSSIP,
         )
         acc.set_graph(G)
-
-        nm, m = acc.get_noise_multiplier(EPSILON, DELTA, algorithm=ALGORITHM, framework=FRAMEWORK)
-        print(f"[Privacy] Calculated Noise Multiplier: {nm:.4f}")
+        if SET_NM is None:
+            nm, m = acc.get_noise_multiplier(EPSILON, DELTA, algorithm=ALGORITHM, framework=FRAMEWORK)
+            print(f"[Privacy] Calculated Noise Multiplier: {nm:.4f}")
+        else:
+            nm = SET_NM
+            print(f"[Privacy] Using Set Noise Multiplier: {nm:.4f}")
     else:
         nm = 0.0
 
@@ -258,6 +311,11 @@ def main():
     all_indices = np.random.permutation(len(train_dataset))
     node_objects = {}
 
+    print("Initializing global model for consistent starting weights...")
+    global_model = get_roberta_lora_model(num_classes=2)
+    global_state_dict = {k: v.cpu().clone() for k, v in global_model.state_dict().items()}
+    del global_model
+
     for i, node_name in enumerate(nodes_list):
         start_idx = i * samples_per_node
         end_idx = (i + 1) * samples_per_node
@@ -270,6 +328,7 @@ def main():
             noise_multiplier=nm,
             num_classes=2,
             enable_privacy=ENABLE_PRIVACY,
+            init_state_dict=global_state_dict,
         )
 
     print("Starting Decentralized Training...")

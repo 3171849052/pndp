@@ -6,12 +6,12 @@ from pndp_calculator import PNDPAccountant
 
 # python example.py
 # ==================== 统一参数 ====================
-N_samples = 100000
-Batch_size = 1000
-T_local_steps = 50
-R_rounds = 10
+N_samples = 4490
+Batch_size = 16
+T_local_steps = 10
+R_rounds = 50
 K_gossip = 1
-epsilon = 3.0
+epsilon = 8.0
 delta = 1e-5
 # =================================================
 
