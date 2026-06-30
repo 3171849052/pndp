@@ -21,14 +21,14 @@ from pndp_calculator import PNDPAccountant
 
 DATASET = "SST2"
 GRAPH = "florentine_families"
-BATCH_SIZE = 32
-T_LOCAL_STEPS = 50
-R_ROUNDS = 5
+BATCH_SIZE = 16
+T_LOCAL_STEPS = 10
+R_ROUNDS = 50
 K_GOSSIP = 1
 EPSILON = 3.0
 DELTA = 1e-5
 CLIP_NORM = 1.0
-LR = 2e-4
+LR = 3e-4
 GPU = 3
 FRAMEWORK = "GDP"   # "GDP" or "RDP"
 ALGORITHM = "Average"   # "Average" "LDP-per-round" "All Numeric"
@@ -153,11 +153,17 @@ def daemonize(log_path):
     log_file = open(log_path, "w")
     os.dup2(log_file.fileno(), sys.stdout.fileno())
     os.dup2(log_file.fileno(), sys.stderr.fileno())
-    
+
+    pid_file = os.path.join(os.path.dirname(log_path), "daemon.pid")
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
+
     # 守护进程返回，准备执行接下来的模型训练代码
 
 
 def main():
+    if GPU is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU)
     foreground = "--foreground" in sys.argv
 
     if os.name == 'nt':
@@ -191,8 +197,6 @@ def main():
 
     global DEVICE
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if GPU is not None and torch.cuda.is_available():
-        torch.cuda.set_device(GPU)
 
     print(f"Using device: {DEVICE}")
 
@@ -279,28 +283,40 @@ def main():
             pbar.set_postfix(node=i)
             loss = node_obj.local_update(T_LOCAL_STEPS, desc=f"  Node {i}")
             round_losses.append(loss)
+            torch.cuda.empty_cache()
         print(f"Average Local Loss: {np.mean(round_losses):.4f}")
 
         weights_snapshot = {}
         for node_name, node_obj in node_objects.items():
-            weights_snapshot[node_name] = {k: v.clone() for k, v in node_obj.model.state_dict().items()}
+            weights_snapshot[node_name] = {
+                name: param.detach().cpu().clone()
+                for name, param in node_obj.model.named_parameters()
+                if param.requires_grad
+            }
+
+        degrees = {n: G.degree(n) for n in G.nodes()}
 
         for node_name in nodes_list:
             neighbors = list(G.neighbors(node_name))
             aggregate_set = neighbors + [node_name]
-            num_participants = len(aggregate_set)
 
-            new_state_dict = {k: torch.zeros_like(v) for k, v in weights_snapshot[node_name].items()}
+            new_state_dict = {}
+            total_weight = 0.0
 
             for neighbor_name in aggregate_set:
+                weight = 1.0 / (max(degrees[node_name], degrees[neighbor_name]) + 1)
+                total_weight += weight
                 neighbor_weights = weights_snapshot[neighbor_name]
-                for k in new_state_dict.keys():
-                    new_state_dict[k] += neighbor_weights[k]
+                for k, v in neighbor_weights.items():
+                    if k not in new_state_dict:
+                        new_state_dict[k] = weight * v.float()
+                    else:
+                        new_state_dict[k] += weight * v.float()
 
-            for k in new_state_dict.keys():
-                new_state_dict[k] = new_state_dict[k] / num_participants
+            for k in new_state_dict:
+                new_state_dict[k] = (new_state_dict[k] / total_weight).to(DEVICE)
 
-            node_objects[node_name].model.load_state_dict(new_state_dict)
+            node_objects[node_name].model.load_state_dict(new_state_dict, strict=False)
 
         accuracies = []
         pbar = tqdm(enumerate(node_objects.items()), desc=f"Round {round_idx+1} Eval", leave=False)
